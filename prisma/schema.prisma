@@ -9,13 +9,42 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Meta {  
-  id        Int      @id @default(autoincrement())
-  titulo    String
-  categoria String   // 'Saude', 'Estudo', 'Trabalho'
-  concluida Boolean  @default(false)
-  data      DateTime @default(now()) @db.Date // Salva apenas a data, sem hora, se possível, ou usa DateTime normal
+// 1. O Hábito Base (O que é?)
+model Habito {
+  id        String   @id @default(uuid())
+  nome      String
+  categoria String   // 'Saúde', 'Trabalho', etc.
   createdAt DateTime @default(now())
 
-  @@map("metas") // Nome da tabela no banco
+  // Relacionamentos
+  planos    Plano[]
+  execucoes Execucao[]
+
+  @@map("habitos")
+}
+
+// 2. O Planejamento (Quando fazer?)
+model Plano {
+  id        String @id @default(uuid())
+  diaSemana String // 'seg', 'ter', 'qua', 'qui', 'sex', 'sab', 'dom'
+  
+  habitoId  String
+  habito    Habito @relation(fields: [habitoId], references: [id], onDelete: Cascade)
+
+  @@unique([diaSemana, habitoId]) // Evita duplicatas no mesmo dia
+  @@map("planos")
+}
+
+// 3. A Execução (Fez ou não fez?)
+model Execucao {
+  id        String   @id @default(uuid())
+  data      DateTime @db.Date // Salva apenas a data (YYYY-MM-DD)
+  
+  habitoId  String
+  habito    Habito @relation(fields: [habitoId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([data, habitoId]) // Garante que só marca como feito 1 vez por dia
+  @@map("execucoes")
 }

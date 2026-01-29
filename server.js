@@ -8,69 +8,124 @@ const prisma = new PrismaClient();
 app.use(express.json());
 app.use(cors());
 
-// 1. Rota para pegar metas de um dia específico (ex: 2026-01-20)
-// Se não mandar data, pega as de hoje.
-app.get('/metas', async (req, res) => {
-  const { data } = req.query; 
-  
-  // Define o início e fim do dia para filtrar
-  const targetDate = data ? new Date(data) : new Date();
-  const startOfDay = new Date(targetDate.setHours(0,0,0,0));
-  const endOfDay = new Date(targetDate.setHours(23,59,59,999));
-
-  const metas = await prisma.meta.findMany({
-    where: {
-      data: {
-        gte: startOfDay,
-        lte: endOfDay
+// --- ROTA MESTRA (Carrega tudo de uma vez) ---
+// O Frontend chama isso ao iniciar. Retorna rotina, plano e status de hoje.
+app.get('/init', async (req, res) => {
+  try {
+    const { data } = req.query; // Espera formato YYYY-MM-DD
+    const dataAlvo = data ? new Date(data) : new Date();
+    
+    // 1. Busca todos os hábitos
+    const habitos = await prisma.habito.findMany({ orderBy: { createdAt: 'asc' } });
+    
+    // 2. Busca o planejamento completo
+    const planosDB = await prisma.plano.findMany();
+    // Transforma array do banco no objeto { seg: [], ter: [] } que o front usa
+    const planoSemanal = { seg: [], ter: [], qua: [], qui: [], sex: [], sab: [], dom: [] };
+    planosDB.forEach(p => {
+      if (planoSemanal[p.diaSemana]) {
+        planoSemanal[p.diaSemana].push(p.habitoId);
       }
-    },
-    orderBy: { id: 'asc' }
-  });
-  
-  res.json(metas);
+    });
+
+    // 3. Busca o que foi concluído na data solicitada
+    const execucoes = await prisma.execucao.findMany({
+      where: { data: dataAlvo },
+      select: { habitoId: true } // Só precisamos dos IDs
+    });
+    const concluidasHoje = execucoes.map(e => e.habitoId);
+
+    res.json({ rotinaBase: habitos, planoSemanal, concluidasHoje });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Erro ao carregar dados iniciais' });
+  }
 });
 
-// 2. Criar Meta
-app.post('/metas', async (req, res) => {
-  const { titulo, categoria, data } = req.body;
-  
-  // Se vier data do front, usa ela, senão usa agora
-  const dataMeta = data ? new Date(data) : new Date();
+// --- 1. GERENCIAR HÁBITOS ---
+app.post('/habitos', async (req, res) => {
+  const { nome, categoria } = req.body;
+  const novo = await prisma.habito.create({
+    data: { nome, categoria }
+  });
+  res.json(novo);
+});
 
-  const novaMeta = await prisma.meta.create({
-    data: {
-      titulo,
-      categoria,
-      data: dataMeta,
-      concluida: false
+app.delete('/habitos/:id', async (req, res) => {
+  const { id } = req.params;
+  await prisma.habito.delete({ where: { id } });
+  res.json({ success: true });
+});
+
+// --- 2. GERENCIAR PLANEJAMENTO ---
+// Adiciona ou remove um hábito de um dia específico (Toggle)
+app.post('/plano/toggle', async (req, res) => {
+  const { habitoId, diaSemana } = req.body;
+
+  // Verifica se já existe
+  const existente = await prisma.plano.findUnique({
+    where: {
+      diaSemana_habitoId: { diaSemana, habitoId }
     }
   });
-  
-  res.json(novaMeta);
+
+  if (existente) {
+    // Se existe, remove (desmarca do planejamento)
+    await prisma.plano.delete({ where: { id: existente.id } });
+    res.json({ acao: 'removido' });
+  } else {
+    // Se não existe, cria
+    await prisma.plano.create({ data: { diaSemana, habitoId } });
+    res.json({ acao: 'adicionado' });
+  }
 });
 
-// 3. Marcar/Desmarcar (Toggle)
-app.patch('/metas/:id/toggle', async (req, res) => {
-  const { id } = req.params;
-  const { concluida } = req.body; // O front manda o novo estado
+// Copiar Segunda para todos os dias
+app.post('/plano/replicar', async (req, res) => {
+  // Primeiro, limpa tudo de Terça a Domingo
+  const diasParaLimpar = ['ter', 'qua', 'qui', 'sex', 'sab', 'dom'];
+  await prisma.plano.deleteMany({ where: { diaSemana: { in: diasParaLimpar } } });
 
-  const metaAtualizada = await prisma.meta.update({
-    where: { id: Number(id) },
-    data: { concluida }
+  // Pega o modelo de Segunda
+  const modeloSegunda = await prisma.plano.findMany({ where: { diaSemana: 'seg' } });
+
+  // Cria cópias
+  const novasEntradas = [];
+  diasParaLimpar.forEach(dia => {
+    modeloSegunda.forEach(item => {
+      novasEntradas.push({ diaSemana: dia, habitoId: item.habitoId });
+    });
   });
 
-  res.json(metaAtualizada);
+  if (novasEntradas.length > 0) {
+    await prisma.plano.createMany({ data: novasEntradas });
+  }
+  
+  res.json({ success: true });
 });
 
-// 4. Deletar Meta
-app.delete('/metas/:id', async (req, res) => {
-  const { id } = req.params;
-  await prisma.meta.delete({ where: { id: Number(id) } });
-  res.json({ message: 'Deletado' });
+// --- 3. GERENCIAR EXECUÇÃO (CHECKLIST) ---
+// Marca ou Desmarca como feito no dia
+app.post('/execucao/toggle', async (req, res) => {
+  const { habitoId, data } = req.body; // data deve ser ISO string YYYY-MM-DD
+  const dataAlvo = new Date(data);
+
+  const existente = await prisma.execucao.findUnique({
+    where: {
+      data_habitoId: { data: dataAlvo, habitoId }
+    }
+  });
+
+  if (existente) {
+    await prisma.execucao.delete({ where: { id: existente.id } });
+    res.json({ status: false }); // Não feito
+  } else {
+    await prisma.execucao.create({ data: { data: dataAlvo, habitoId } });
+    res.json({ status: true }); // Feito
+  }
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🔥 API rodando na porta ${PORT}`);
+  console.log(`🚀 API V3 rodando na porta ${PORT}`);
 });
